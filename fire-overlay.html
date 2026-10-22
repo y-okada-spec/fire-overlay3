@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>タップで育つ炎オーバーレイ</title>
+<link href="https://fonts.googleapis.com/css2?family=Dela+Gothic+One&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; user-select: none; }
+  body.bg-green { background: #00ff00; }
+  body.bg-black { background: #000; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: pointer; }
+  #hud {
+    position: absolute; left: 50%; bottom: 4vh; transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 1vh;
+    font-family: "Dela Gothic One", "Hiragino Kaku Gothic StdN", "Yu Gothic", sans-serif;
+    color: #fff; pointer-events: none;
+  }
+  #level {
+    font-size: 6vh; line-height: 1; letter-spacing: .04em;
+    -webkit-text-stroke: .5vh #2a0800; paint-order: stroke fill;
+    text-shadow: 0 0 2vh rgba(255,120,0,.9);
+    transition: transform .25s cubic-bezier(.3,1.8,.5,1);
+  }
+  #level.pop { transform: scale(1.35); }
+  #bar {
+    width: 34vh; height: 1.6vh; border-radius: 1vh;
+    background: rgba(40,10,0,.55); border: .3vh solid rgba(255,255,255,.85);
+    overflow: hidden;
+  }
+  #fill { height: 100%; width: 0%; background: linear-gradient(90deg,#ffcf40,#ff5a1f,#e0115f); transition: width .15s linear; }
+  #hint {
+    font-size: 2.2vh; opacity: .9;
+    -webkit-text-stroke: .3vh #2a0800; paint-order: stroke fill;
+  }
+  body.hide-hud #hud { display: none; }
+  @media (prefers-reduced-motion: reduce) { #level { transition: none; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="level">火種</div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="hint">タップで炎を育てよう</div>
+</div>
+
+<script>
+// ===== 設定(URLパラメータで変更可) =====
+// ?per=2       1タップで増えるゲージ量(0〜100)
+// ?decay=4     タップが止まってから1秒あたり減る量(0で減らない)
+// ?idle=3      タップが止まってから減り始めるまでの秒数
+// ?bg=green    背景を緑(クロマキー用) / black / 省略で透明
+// ?hud=0       レベル表示とゲージを隠す
+// ?ws=ws://localhost:21213/   TikFinity等のWebSocketからいいねを受け取る
+const P = new URLSearchParams(location.search);
+const PER   = parseFloat(P.get('per')   ?? 2);
+const DECAY = parseFloat(P.get('decay') ?? 4);
+const IDLE  = parseFloat(P.get('idle')  ?? 3);
+if (P.get('bg') === 'green') document.body.classList.add('bg-green');
+if (P.get('bg') === 'black') document.body.classList.add('bg-black');
+if (P.get('hud') === '0') document.body.classList.add('hide-hud');
+
+// ===== 段階 =====
+const STAGES = [
+  { at: 0,   name: '火種',   core: [255,200,80],  edge: [255,70,0]   },
+  { at: 20,  name: '小さな炎', core: [255,210,90],  edge: [255,80,10]  },
+  { at: 40,  name: '燃え上がる', core: [255,230,120], edge: [255,50,0]   },
+  { at: 60,  name: '大炎上',  core: [255,240,160], edge: [230,20,40]  },
+  { at: 80,  name: '紫炎',   core: [255,190,255], edge: [150,30,220] },
+  { at: 100, name: '蒼炎 MAX', core: [220,250,255], edge: [30,110,255] },
+];
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const levelEl = document.getElementById('level');
+const fillEl = document.getElementById('fill');
+const hintEl = document.getElementById('hint');
+
+let W, H, DPR;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+let value = 0;          // 0〜100
+let shown = 0;          // 表示用に滑らかに追従
+let lastTap = -1e9;
+let stageIdx = 0;
+let flash = 0;
+const parts = [];
+const sparks = [];
+
+function stageOf(v) {
+  let i = 0;
+  for (let k = 0; k < STAGES.length; k++) if (v >= STAGES[k].at) i = k;
+  return i;
+}
+const lerp = (a, b, t) => a + (b - a) * t;
+function mixColor(t) {
+  // 現在値に合わせて段階間で色を補間
+  const i = stageOf(shown);
+  const a = STAGES[i], b = STAGES[Math.min(i + 1, STAGES.length - 1)];
+  const span = (b.at - a.at) || 1;
+  const f = Math.min(1, Math.max(0, (shown - a.at) / span)) * (b === a ? 0 : 1);
+  const pick = (k) => a[k].map((c, j) => lerp(c, b[k][j], f));
+  return { core: pick('core'), edge: pick('edge') };
+}
+
+function addHeat(n = 1) {
+  value = Math.min(100, value + PER * n);
+  lastTap = performance.now();
+  // タップ感の火の粉
+  for (let i = 0; i < Math.min(12, 3 + n); i++) spawnSpark();
+}
+
+function spawnSpark() {
+  const t = shown / 100;
+  sparks.push({
+    x: W / 2 + (Math.random() - .5) * (40 + t * 160),
+    y: H * .82 - Math.random() * 40,
+    vx: (Math.random() - .5) * 2.5,
+    vy: -(2 + Math.random() * 4) * (1 + t),
+    life: 1, r: 1 + Math.random() * 2.2,
+  });
+}
+
+function spawnFlame() {
+  const t = shown / 100;
+  const baseW = 30 + t * 220;
+  const size = 14 + t * 60;
+  parts.push({
+    x: W / 2 + (Math.random() - .5) * baseW,
+    y: H * .84 + Math.random() * 6,
+    vx: (Math.random() - .5) * .6,
+    vy: -(1.2 + Math.random() * 1.6) * (1 + t * 1.6),
+    r: size * (.6 + Math.random() * .6),
+    life: 1,
+    decay: .012 + Math.random() * .01 - t * .004,
+    wob: Math.random() * Math.PI * 2,
+  });
+}
+
+// クリック/タップ・スペースキーでも加熱
+cv.addEventListener('pointerdown', () => addHeat(1));
+addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.code === 'Enter') addHeat(1);
+  if (e.code === 'KeyR') value = 0; // リセット
+});
+
+let prev = performance.now();
+function frame(now) {
+  const dt = Math.min(.05, (now - prev) / 1000); prev = now;
+
+  // 減衰
+  if (DECAY > 0 && (now - lastTap) / 1000 > IDLE) value = Math.max(0, value - DECAY * dt);
+  shown = lerp(shown, value, 1 - Math.pow(.001, dt));
+
+  // 段階変化
+  const s = stageOf(value);
+  if (s !== stageIdx) {
+    if (s > stageIdx) { flash = 1; for (let i = 0; i < 40; i++) spawnSpark(); }
+    stageIdx = s;
+    levelEl.textContent = STAGES[s].name;
+    levelEl.classList.add('pop');
+    setTimeout(() => levelEl.classList.remove('pop'), 250);
+  }
+  fillEl.style.width = value.toFixed(1) + '%';
+  hintEl.style.opacity = value < 1 ? .9 : 0;
+
+  // 粒子生成量は強さに比例
+  const t = shown / 100;
+  const rate = 2 + Math.floor(t * 9);
+  for (let i = 0; i < rate; i++) spawnFlame();
+  if (t > .3 && Math.random() < t * .5) spawnSpark();
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  const col = mixColor();
+
+  // 根元の光
+  const glowR = 60 + t * 260 + flash * 120;
+  const g = ctx.createRadialGradient(W/2, H*.82, 0, W/2, H*.82, glowR);
+  g.addColorStop(0, `rgba(${col.edge.join(',')},${.35 + t*.25 + flash*.3})`);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(W/2, H*.82, glowR, 0, Math.PI*2); ctx.fill();
+
+  // 炎
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.wob += dt * 6;
+    p.x += p.vx + Math.sin(p.wob) * .5 + (W/2 - p.x) * .012; // 中心に寄せて炎の形に
+    p.y += p.vy;
+    p.life -= p.decay;
+    if (p.life <= 0) { parts.splice(i, 1); continue; }
+    const r = p.r * (.4 + p.life * .8);
+    const c = p.life > .55 ? col.core : col.edge;
+    const a = Math.min(1, p.life * 1.4) * .32;
+    const pg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+    pg.addColorStop(0, `rgba(${c.map(Math.round).join(',')},${a})`);
+    pg.addColorStop(1, `rgba(${col.edge.map(Math.round).join(',')},0)`);
+    ctx.fillStyle = pg;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI*2); ctx.fill();
+  }
+
+  // 火の粉
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const s2 = sparks[i];
+    s2.x += s2.vx + Math.sin(now/200 + i) * .4;
+    s2.y += s2.vy; s2.vy *= .99;
+    s2.life -= .012;
+    if (s2.life <= 0) { sparks.splice(i, 1); continue; }
+    ctx.fillStyle = `rgba(${col.core.map(Math.round).join(',')},${s2.life})`;
+    ctx.beginPath(); ctx.arc(s2.x, s2.y, s2.r, 0, Math.PI*2); ctx.fill();
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  flash = Math.max(0, flash - dt * 2);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ===== TikFinity等のWebSocket連携(任意) =====
+// like イベントの likeCount 分だけ加熱、ギフトはまとめて大きく加熱
+const WS_URL = P.get('ws');
+function connect() {
+  if (!WS_URL) return;
+  let ws;
+  try { ws = new WebSocket(WS_URL); } catch (e) { return setTimeout(connect, 5000); }
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    const type = m.event || m.type;
+    const d = m.data || m;
+    if (type === 'like') addHeat(Math.min(15, d.likeCount || 1));
+    else if (type === 'gift') addHeat(Math.min(50, (d.diamondCount || 1) * (d.repeatCount || 1)));
+  };
+  ws.onclose = () => setTimeout(connect, 5000);
+}
+connect();
+</script>
+</body>
+</html>
